@@ -110,10 +110,12 @@ import com.android.internal.statusbar.IStatusBarService;
 import com.android.internal.widget.PointerLocationView;
 import com.android.server.LocalServices;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 
@@ -182,6 +184,9 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     static public final String SYSTEM_DIALOG_REASON_RECENT_APPS = "recentapps";
     static public final String SYSTEM_DIALOG_REASON_HOME_KEY = "homekey";
     static public final String SYSTEM_DIALOG_REASON_ASSIST = "assist";
+
+    static public final String ALLOW_APP_BACKGROUND_PATH = "/system/etc/allowbackgroundapp.list";
+    static private ArrayList<String> mBackAppList = new ArrayList<String>();
 
     /**
      * These are the system UI flags that, when changing, can cause the layout
@@ -332,6 +337,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     boolean mSystemReady;
     boolean mSystemBooted;
     boolean mHdmiPlugged;
+    final Object mHdmiHwPluggedLock = new Object();
     IUiModeManager mUiModeManager;
     int mUiMode;
     int mDockMode = Intent.EXTRA_DOCK_STATE_UNDOCKED;
@@ -1344,10 +1350,16 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         // Controls rotation and the like.
         initializeHdmiState();
 
+        filter = new IntentFilter();
+        filter.addAction("com.droidlogic.instaboot.RESTORE_COMPLETED");
+        context.registerReceiver(mInstabootReceiver, filter);
+
         // Match current screen state.
         if (!mPowerManager.isInteractive()) {
             goingToSleep(WindowManagerPolicy.OFF_BECAUSE_OF_USER);
         }
+
+        initAllowpackageBackground();
     }
 
     /**
@@ -1382,29 +1394,81 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
         final Resources res = mContext.getResources();
         int shortSize, longSize;
+        int rotation = SystemProperties.getInt("ro.display.rotation", 0);
+        if (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270) {
+            rotation = 0;
+        }
         if (width > height) {
             shortSize = height;
             longSize = width;
-            mLandscapeRotation = Surface.ROTATION_0;
-            mSeascapeRotation = Surface.ROTATION_180;
-            if (res.getBoolean(com.android.internal.R.bool.config_reverseDefaultRotation)) {
+            if (rotation == 0) {
+                mLandscapeRotation = Surface.ROTATION_0;
+                mSeascapeRotation = Surface.ROTATION_180;
+            } else if (rotation == 180) {
+                mLandscapeRotation = Surface.ROTATION_180;
+                mSeascapeRotation = Surface.ROTATION_0;
+            } else if (rotation == 90) {
                 mPortraitRotation = Surface.ROTATION_90;
                 mUpsideDownRotation = Surface.ROTATION_270;
-            } else {
+            } else if (rotation == 270) {
                 mPortraitRotation = Surface.ROTATION_270;
                 mUpsideDownRotation = Surface.ROTATION_90;
+            }
+
+            if (rotation == 0 || rotation == 180) {
+                if (res.getBoolean(com.android.internal.R.bool.config_reverseDefaultRotation)) {
+                    mPortraitRotation = Surface.ROTATION_90;
+                    mUpsideDownRotation = Surface.ROTATION_270;
+                } else {
+                    mPortraitRotation = Surface.ROTATION_270;
+                    mUpsideDownRotation = Surface.ROTATION_90;
+                }
+            }
+
+            if (rotation == 90 || rotation == 270) {
+                if (res.getBoolean(com.android.internal.R.bool.config_reverseDefaultRotation)) {
+                    mLandscapeRotation = Surface.ROTATION_0;
+                    mSeascapeRotation = Surface.ROTATION_180;
+                } else {
+                    mLandscapeRotation = Surface.ROTATION_180;
+                    mSeascapeRotation = Surface.ROTATION_0;
+                }
             }
         } else {
             shortSize = width;
             longSize = height;
-            mPortraitRotation = Surface.ROTATION_0;
-            mUpsideDownRotation = Surface.ROTATION_180;
-            if (res.getBoolean(com.android.internal.R.bool.config_reverseDefaultRotation)) {
-                mLandscapeRotation = Surface.ROTATION_270;
-                mSeascapeRotation = Surface.ROTATION_90;
-            } else {
+            if (rotation == 0) {
+                mPortraitRotation = Surface.ROTATION_0;
+                mUpsideDownRotation = Surface.ROTATION_180;
+            } else if (rotation == 180) {
+                mPortraitRotation = Surface.ROTATION_180;
+                mUpsideDownRotation = Surface.ROTATION_0;
+            } else if (rotation == 90) {
                 mLandscapeRotation = Surface.ROTATION_90;
                 mSeascapeRotation = Surface.ROTATION_270;
+            } else if (rotation == 270) {
+                mLandscapeRotation = Surface.ROTATION_270;
+                mSeascapeRotation = Surface.ROTATION_90;
+            }
+
+            if (rotation == 0 || rotation == 180) {
+                if (res.getBoolean(com.android.internal.R.bool.config_reverseDefaultRotation)) {
+                    mLandscapeRotation = Surface.ROTATION_270;
+                    mSeascapeRotation = Surface.ROTATION_90;
+                } else {
+                    mLandscapeRotation = Surface.ROTATION_90;
+                    mSeascapeRotation = Surface.ROTATION_270;
+                }
+            }
+
+            if (rotation == 90 || rotation == 270) {
+                if (res.getBoolean(com.android.internal.R.bool.config_reverseDefaultRotation)) {
+                    mPortraitRotation = Surface.ROTATION_0;
+                    mUpsideDownRotation = Surface.ROTATION_180;
+                } else {
+                    mPortraitRotation = Surface.ROTATION_180;
+                    mUpsideDownRotation = Surface.ROTATION_0;
+                }
             }
         }
 
@@ -4372,13 +4436,19 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     }
 
     void setHdmiPlugged(boolean plugged) {
-        if (mHdmiPlugged != plugged) {
-            mHdmiPlugged = plugged;
-            updateRotation(true, true);
-            Intent intent = new Intent(ACTION_HDMI_PLUGGED);
-            intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
-            intent.putExtra(EXTRA_HDMI_PLUGGED_STATE, plugged);
-            mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+        String instabootstatus = SystemProperties.get("instaboot.status", "completed");
+        if (instabootstatus.equals("booting")) {
+            return;
+        }
+        synchronized(mHdmiHwPluggedLock){
+            if (mHdmiPlugged != plugged) {
+                mHdmiPlugged = plugged;
+                updateRotation(true, true);
+                Intent intent = new Intent(ACTION_HDMI_PLUGGED);
+                intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+                intent.putExtra(EXTRA_HDMI_PLUGGED_STATE, plugged);
+                mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+            }
         }
     }
 
@@ -4982,6 +5052,43 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         }
     };
 
+    private BroadcastReceiver mInstabootReceiver = new BroadcastReceiver(){
+        @Override
+        public void onReceive(Context context, Intent intent) {
+
+            final String action = intent.getAction();
+            if ("com.droidlogic.instaboot.RESTORE_COMPLETED".equals(action)) {
+                Log.i(TAG,"restore system completed");
+                synchronized(mHdmiHwPluggedLock){
+                    boolean plugged = false;
+                    final String filename = "/sys/class/switch/hdmi/state";
+                    FileReader reader = null;
+                    try {
+                        reader = new FileReader(filename);
+                        char[] buf = new char[15];
+                        int n = reader.read(buf);
+                        if (n > 1) {
+                            plugged = 0 != Integer.parseInt(new String(buf, 0, n-1));
+                        }
+                    } catch (IOException ex) {
+                        Slog.w(TAG, "Couldn't read hdmi state from " + filename + ": " + ex);
+                    } catch (NumberFormatException ex) {
+                        Slog.w(TAG, "Couldn't read hdmi state from " + filename + ": " + ex);
+                    } finally {
+                        if (reader != null) {
+                            try {
+                                reader.close();
+                            } catch (IOException ex) {
+                            }
+                        }
+                    }
+                    mHdmiPlugged = plugged;
+                    Log.i(TAG,"restore hdmi status as "+mHdmiPlugged);
+                }
+            }
+        }
+    };
+
     private final Runnable mRequestTransientNav = new Runnable() {
         @Override
         public void run() {
@@ -5312,7 +5419,17 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                         );
         }
 
-        if (mForceDefaultOrientation) {
+        /*
+        * property: persist.sys.app.rotation has three cases:
+        * 1.force_land: always show with landscape, if a portrait apk, system will scale up it
+        * 2.middle_port: if a portrait apk, will show in the middle of the screen, left and right will show black
+        * 3.original: original orientation, if a portrait apk, will rotate 270 degree
+        */
+        String rot = SystemProperties.get("persist.sys.app.rotation", "middle_port");
+        if (rot.equals("force_land"))
+            return mLandscapeRotation;
+
+        if (mForceDefaultOrientation && rot.equals("middle_port")) {
             return Surface.ROTATION_0;
         }
 
@@ -5468,6 +5585,9 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
     @Override
     public boolean rotationHasCompatibleMetricsLw(int orientation, int rotation) {
+        if (SystemProperties.get("persist.sys.app.rotation", "middle_port").equals("force_land"))
+            return true;
+
         switch (orientation) {
             case ActivityInfo.SCREEN_ORIENTATION_PORTRAIT:
             case ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT:
@@ -5847,7 +5967,74 @@ public class PhoneWindowManager implements WindowManagerPolicy {
             }
         }
 
+        final ActivityManager am = (ActivityManager) mContext.getSystemService(Context.ACTIVITY_SERVICE);
+        ComponentName cn = am.getRunningTasks (1).get (0).topActivity;
+        final String packageName = cn.getPackageName();
+
         startActivityAsUser(mHomeIntent, UserHandle.CURRENT);
+
+        if (SystemProperties.getBoolean("ro.platform.has.mbxuimode", false)
+            && !checkAllowPackageBackground(packageName)
+            && !getLauncherPackageName().contains(packageName)) {
+            Handler killPackageHandler = new Handler(mContext.getMainLooper());
+            killPackageHandler.postDelayed(new Runnable() {
+                public void run() {
+                    am.forceStopPackage(packageName);
+               }
+            }, 500);
+        }
+    }
+
+    private void initAllowpackageBackground() {
+        String str = null;
+        mBackAppList.clear();
+        try {
+            File fl = new File(ALLOW_APP_BACKGROUND_PATH);
+            if (!fl.exists()) {
+                mBackAppList.add("all");
+                return;
+            }
+            FileReader fr = new FileReader(ALLOW_APP_BACKGROUND_PATH);
+            BufferedReader br = new BufferedReader(fr);
+            while ((str = br.readLine()) != null) {
+                if (str.equals("all")) {
+                    mBackAppList.clear();
+                    mBackAppList.add("all");
+                    break;
+                } else {
+                    mBackAppList.add(str);
+                }
+            };
+            br.close();
+            fr.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public boolean checkAllowPackageBackground(String pack) {
+        if (mBackAppList.contains("all") || mBackAppList.contains(pack)) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public String getLauncherPackageName() {
+        String packageNames = null;
+        final Intent intent = new Intent(Intent.ACTION_MAIN);
+        intent.addCategory(Intent.CATEGORY_HOME);
+
+        List<ResolveInfo> resolveInfo = mContext.getPackageManager().queryIntentActivities(intent,
+                PackageManager.MATCH_DEFAULT_ONLY);
+        for (ResolveInfo ri : resolveInfo) {
+            packageNames = packageNames + ri.activityInfo.packageName + ",";
+        }
+        if (packageNames == null || packageNames.length() == 0) {
+            return null;
+        } else {
+            return packageNames;
+        }
     }
 
     /**
